@@ -1,0 +1,53 @@
+name: 'Destroy Terraform Resources'
+description: 'Destroys resources deployed with Terraform'
+
+inputs:
+  environment:
+    description: 'Environment tag to destroy (dev/prod)'
+    required: true
+  deploy-name:
+    description: >-
+      The computed deployment name used at deploy time (see
+      scripts/compute-deploy-name.sh) — selects both the state file this
+      destroy reads and the resource names within it.
+    required: true
+  vpc-id:
+    description: 'VPC ID resources were deployed into (from config/project-config.json)'
+    required: true
+  subnet-ids:
+    description: 'Comma-separated subnet IDs resources were deployed into (from config/project-config.json)'
+    required: true
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Set up Terraform
+      uses: hashicorp/setup-terraform@v4
+
+    - name: Initialize Terraform
+      shell: bash
+      env:
+        DEPLOY_NAME: ${{ inputs.deploy-name }}
+      run: |
+        cd infrastructure/terraform
+        terraform init -backend-config=backend.hcl -backend-config="key=envs/${DEPLOY_NAME}/terraform.tfstate"
+
+    # vpc-id/subnet-ids are passed explicitly (not left to terraform.tfvars)
+    # for the same reason the deploy side does: reads config/project-config.json
+    # fresh instead of trusting a value captured once at init.sh time.
+    - name: Destroy Terraform Resources
+      shell: bash
+      env:
+        ENVIRONMENT: ${{ inputs.environment }}
+        DEPLOY_NAME: ${{ inputs.deploy-name }}
+        VPC_ID: ${{ inputs.vpc-id }}
+        SUBNET_IDS: ${{ inputs.subnet-ids }}
+      run: |
+        cd infrastructure/terraform
+        SUBNET_IDS_JSON=$(printf '%s' "$SUBNET_IDS" | jq -Rc 'split(",")')
+        echo "Destroying Terraform resources for $DEPLOY_NAME ($ENVIRONMENT)"
+        terraform destroy -auto-approve \
+          -var="environment=${ENVIRONMENT}" \
+          -var="project_name=${DEPLOY_NAME}" \
+          -var="vpc_id=${VPC_ID}" \
+          -var="subnet_ids=${SUBNET_IDS_JSON}"

@@ -1,0 +1,8 @@
+{
+  "name": "example-lambda-function",
+  "version": "1.0.0",
+  "description": "Example AWS Lambda function",
+  "main": "index.js",
+  "author": "",
+  "license": "MIT"
+}

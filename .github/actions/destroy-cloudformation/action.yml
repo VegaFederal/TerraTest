@@ -1,0 +1,109 @@
+name: 'Destroy CloudFormation Resources'
+description: 'Empties the S3 buckets a project stack created, then deletes the stack (nested stacks are removed automatically as part of the parent stack)'
+
+inputs:
+  project-name:
+    description: 'Project name used as the CloudFormation stack name'
+    required: true
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Look up buckets created by the stack
+      shell: bash
+      env:
+        STACK_NAME: ${{ inputs.project-name }}
+      run: |
+        # WEBSITE_BUCKET is computed directly from the same deterministic
+        # naming formula static-website.yaml uses (DeploymentName == this
+        # stack's own name), not read from the stack's Outputs. Outputs
+        # only populate once the stack — and the nested StaticWebsiteStack
+        # it's read through — reaches a fully complete state, so a stack
+        # left over from an earlier failed deploy can have no Outputs at
+        # all, silently skipping the bucket-empty step below and making
+        # the stack delete fail on a non-empty bucket.
+        ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+        WEBSITE_BUCKET="${STACK_NAME}-website-${ACCOUNT_ID}"
+        echo "WEBSITE_BUCKET=$WEBSITE_BUCKET" >> "$GITHUB_ENV"
+
+        # TEMPLATE_BUCKET isn't deterministic — it has a deploy-time
+        # timestamp baked in — so it does have to be looked up. Parameters
+        # are recorded at stack-creation time and stay visible via
+        # describe-stacks regardless of whether the stack ever reached a
+        # complete state, unlike Outputs, so this one is safe to read this way.
+        TEMPLATE_BUCKET=$(aws cloudformation describe-stacks --stack-name "$STACK_NAME" \
+          --query "Stacks[0].Parameters[?ParameterKey=='TemplateBucket'].ParameterValue" \
+          --output text 2>/dev/null || echo "")
+        echo "TEMPLATE_BUCKET=$TEMPLATE_BUCKET" >> "$GITHUB_ENV"
+
+    - name: Empty S3 buckets
+      shell: bash
+      run: |
+        empty_bucket() {
+          local BUCKET="$1"
+          if [ -z "$BUCKET" ] || [ "$BUCKET" = "None" ]; then
+            return 0
+          fi
+          if ! aws s3api head-bucket --bucket "$BUCKET" 2>/dev/null; then
+            echo "Bucket '$BUCKET' does not exist or is not accessible — skipping."
+            return 0
+          fi
+          echo "Emptying bucket: $BUCKET"
+
+          # Delete all current objects
+          aws s3 rm "s3://$BUCKET" --recursive
+
+          # Delete all versioned objects and delete markers (required when
+          # versioning is enabled, as is the case for WebsiteBucket)
+          aws s3api list-object-versions --bucket "$BUCKET" \
+            --query '{Objects: Versions[].{Key:Key,VersionId:VersionId}}' \
+            --output json 2>/dev/null \
+            | jq -e '.Objects | length > 0' > /dev/null 2>&1 \
+            && aws s3api delete-objects --bucket "$BUCKET" \
+                 --delete "$(aws s3api list-object-versions --bucket "$BUCKET" \
+                   --query '{Objects: Versions[].{Key:Key,VersionId:VersionId}}' \
+                   --output json)" \
+            || true
+
+          aws s3api list-object-versions --bucket "$BUCKET" \
+            --query '{Objects: DeleteMarkers[].{Key:Key,VersionId:VersionId}}' \
+            --output json 2>/dev/null \
+            | jq -e '.Objects | length > 0' > /dev/null 2>&1 \
+            && aws s3api delete-objects --bucket "$BUCKET" \
+                 --delete "$(aws s3api list-object-versions --bucket "$BUCKET" \
+                   --query '{Objects: DeleteMarkers[].{Key:Key,VersionId:VersionId}}' \
+                   --output json)" \
+            || true
+
+          # Confirm the bucket is truly empty before proceeding
+          REMAINING=$(aws s3api list-object-versions --bucket "$BUCKET" \
+            --query 'length(Versions || `[]`) + length(DeleteMarkers || `[]`)' \
+            --output text 2>/dev/null || echo "0")
+          if [ "$REMAINING" != "0" ] && [ "$REMAINING" != "None" ]; then
+            echo "ERROR: Bucket '$BUCKET' still has $REMAINING versioned objects after emptying. Aborting."
+            exit 1
+          fi
+
+          echo "Bucket '$BUCKET' is empty."
+        }
+
+        empty_bucket "$WEBSITE_BUCKET"
+        empty_bucket "$TEMPLATE_BUCKET"
+
+    - name: Delete CloudFormation stack
+      shell: bash
+      env:
+        STACK_NAME: ${{ inputs.project-name }}
+      run: |
+        echo "Deleting stack: $STACK_NAME"
+        aws cloudformation delete-stack --stack-name "$STACK_NAME"
+        aws cloudformation wait stack-delete-complete --stack-name "$STACK_NAME"
+        echo "Stack $STACK_NAME deleted successfully"
+
+    - name: Delete template bucket
+      shell: bash
+      run: |
+        if [ -n "$TEMPLATE_BUCKET" ] && [ "$TEMPLATE_BUCKET" != "None" ] && aws s3api head-bucket --bucket "$TEMPLATE_BUCKET" 2>/dev/null; then
+          echo "Deleting template bucket: $TEMPLATE_BUCKET"
+          aws s3 rb "s3://$TEMPLATE_BUCKET" --force
+        fi

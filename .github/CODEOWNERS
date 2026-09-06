@@ -1,0 +1,4 @@
+# Default owners for everything in the repo, unless a more specific rule
+# below takes precedence. Replace this with your actual GitHub username(s)
+# or team(s) — this placeholder won't request reviews from anyone until you do.
+* @marklopervega

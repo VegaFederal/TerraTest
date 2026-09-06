@@ -1,0 +1,157 @@
+name: Pull Request Checks
+
+on:
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v3
+    
+    - name: Set up Node.js
+      uses: actions/setup-node@v3
+      with:
+        node-version: '22'
+        cache: 'npm'
+    
+    - name: Install dependencies
+      run: |
+        if [ -f package.json ]; then
+          npm ci
+        else
+          echo "No package.json found, skipping npm install"
+        fi
+    
+    - name: Run tests
+      run: |
+        if [ -f package.json ] && grep -q '"test"' package.json; then
+          npm test
+        else
+          echo "No tests to run"
+        fi
+
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v3
+    
+    - name: Set up Node.js
+      uses: actions/setup-node@v3
+      with:
+        node-version: '22'
+        cache: 'npm'
+    
+    - name: Install dependencies
+      run: |
+        if [ -f package.json ]; then
+          npm ci
+        else
+          echo "No package.json found, skipping npm install"
+        fi
+    
+    - name: Lint code
+      run: |
+        if [ -f package.json ] && grep -q '"lint"' package.json; then
+          npm run lint
+        else
+          echo "No lint script found, skipping"
+        fi
+
+  security-scan:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v3
+    
+    - name: Run Trivy vulnerability scanner
+      uses: aquasecurity/trivy-action@master
+      with:
+        scan-type: 'fs'
+        ignore-unfixed: true
+        format: 'sarif'
+        output: 'trivy-results.sarif'
+        severity: 'CRITICAL,HIGH'
+    
+    - name: Upload Trivy scan results to GitHub Security tab
+      uses: github/codeql-action/upload-sarif@v2
+      if: always()
+      with:
+        sarif_file: 'trivy-results.sarif'
+
+  infrastructure-validation:
+    name: Validate Infrastructure
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v3
+
+    - name: Lint CloudFormation templates
+      run: |
+        if [ -d infrastructure/cloudformation ]; then
+          pip install cfn-lint
+          cfn-lint $(find infrastructure/cloudformation -name '*.yaml')
+        else
+          echo "No CloudFormation templates found, skipping lint"
+        fi
+
+    - name: Set up Terraform
+      if: hashFiles('infrastructure/terraform/**') != ''
+      uses: hashicorp/setup-terraform@v4
+
+    - name: Validate Terraform
+      run: |
+        if [ -d infrastructure/terraform ]; then
+          cd infrastructure/terraform
+          terraform init -backend=false
+          terraform validate
+        else
+          echo "No Terraform project found, skipping validation"
+        fi
+
+    # Security/best-practice scan across whatever IaC is present. soft_fail
+    # is on for now: the example templates have a couple of deliberately open
+    # rules (e.g. the public web security group), so this starts as a visible
+    # report rather than a hard gate. Flip soft_fail off once the baseline
+    # findings have been reviewed and either fixed or explicitly skipped.
+    - name: Checkov IaC security scan
+      uses: bridgecrewio/checkov-action@v12
+      with:
+        directory: infrastructure
+        soft_fail: true
+
+  build:
+    name: Build
+    needs: [test, lint, security-scan, infrastructure-validation]
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v3
+    
+    - name: Set up Node.js
+      uses: actions/setup-node@v3
+      with:
+        node-version: '22'
+        cache: 'npm'
+    
+    - name: Install dependencies
+      run: |
+        if [ -f package.json ]; then
+          npm ci
+        else
+          echo "No package.json found, skipping npm install"
+        fi
+    
+    - name: Build
+      run: |
+        if [ -f package.json ] && grep -q '"build"' package.json; then
+          npm run build
+        else
+          echo "No build script found, skipping"
+        fi

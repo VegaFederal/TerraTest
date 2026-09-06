@@ -1,0 +1,292 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    # Dependabot branches don't need a full AWS deploy attempt — they get
+    # validated by pull-request.yml once the PR opens, same as any other PR.
+    branches-ignore: [ 'dependabot/**' ]
+  # Used for the destroy side instead of push-to-main: a plain push event
+  # doesn't carry the name of the branch that was just merged, but a closed
+  # PR does (github.event.pull_request.head.ref) — and that branch name is
+  # what deploy used to name everything, so destroy needs it to find the
+  # same resources again.
+  pull_request:
+    types: [ closed ]
+    branches: [ main ]
+  workflow_dispatch:
+    inputs:
+      action:
+        description: 'Action to perform'
+        required: true
+        default: 'deploy'
+        type: choice
+        options:
+          - deploy
+          - cleanup
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - name: Set up environment
+        run: echo "Setting up test environment"
+      - name: Run tests
+        run: echo "Running tests"
+
+  # Deploys a dev environment for whatever was just pushed. Runs
+  # automatically on every push, including to main — main is the
+  # integration branch here, so merging a feature branch into it
+  # redeploys main's own environment (named from branch "main", same
+  # scheme as any feature branch) in addition to the cleanup job below
+  # destroying the merged feature branch's now-obsolete environment.
+  deploy:
+    if: |
+      (github.event_name == 'push') ||
+      (github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'deploy')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION || 'us-east-1' }}
+
+      - name: Read configuration
+        id: config
+        run: |
+          CONFIG_FILE="config/project-config.json"
+          if [ ! -f "$CONFIG_FILE" ]; then
+            echo "Error: Config file not found at $CONFIG_FILE"
+            exit 1
+          fi
+
+          INFRA_TYPE=$(jq -r '.infraType' $CONFIG_FILE)
+          APP_TYPE=$(jq -r '.applicationType' $CONFIG_FILE)
+          VPC_ID=$(jq -r '.vpcId' $CONFIG_FILE)
+          SUBNET_IDS=$(jq -r '.subnetIds' $CONFIG_FILE)
+
+          echo "INFRA_TYPE=$INFRA_TYPE" >> $GITHUB_ENV
+          echo "APP_TYPE=$APP_TYPE" >> $GITHUB_ENV
+          echo "VPC_ID=$VPC_ID" >> $GITHUB_ENV
+          echo "SUBNET_IDS=$SUBNET_IDS" >> $GITHUB_ENV
+
+      # A short, deterministic, AWS-safe identifier for this branch's dev
+      # environment — named from the repo itself (not config/project-
+      # config.json's free-text projectName), so it can never drift from
+      # or collide with another repo using a similar project name.
+      - name: Compute deployment name
+        env:
+          BRANCH_NAME: ${{ github.ref_name }}
+          REPO_NAME: ${{ github.repository }}
+        run: |
+          REPO_NAME="${REPO_NAME#*/}"
+          DEPLOY_NAME=$(./scripts/compute-deploy-name.sh "$REPO_NAME" "$BRANCH_NAME")
+          echo "DEPLOY_NAME=$DEPLOY_NAME" >> $GITHUB_ENV
+          echo "Deployment name: $DEPLOY_NAME"
+
+      - name: Set up Node.js
+        if: env.APP_TYPE == 'serverless'
+        uses: actions/setup-node@v3
+        with:
+          node-version: '22'
+
+      # --- CloudFormation ---
+      - name: Create template bucket
+        if: env.INFRA_TYPE == 'cloudformation'
+        run: |
+            TIMESTAMP=$(date +%s)
+            TEMPLATE_BUCKET="${DEPLOY_NAME}-templates-${TIMESTAMP}"
+            echo "TEMPLATE_BUCKET=$TEMPLATE_BUCKET" >> $GITHUB_ENV
+
+            echo "Creating bucket: $TEMPLATE_BUCKET"
+            aws s3 mb s3://$TEMPLATE_BUCKET
+
+      - name: Upload templates to S3
+        if: env.INFRA_TYPE == 'cloudformation'
+        run: aws s3 sync infrastructure/cloudformation/templates/ s3://$TEMPLATE_BUCKET/templates/
+
+      - name: Upload Lambda code to S3
+        if: env.INFRA_TYPE == 'cloudformation'
+        run: |
+          cd src/lambda/example-function
+          zip -r /tmp/example-function.zip .
+          aws s3 cp /tmp/example-function.zip s3://$TEMPLATE_BUCKET/lambda/example-function.zip
+
+      # Plain AWS CLI rather than a wrapper action: the CLI's own
+      # --parameter-overrides takes space-separated Key=Value tokens, so a
+      # multi-value parameter's internal comma (SubnetIds) is never
+      # ambiguous — no quoting workaround needed.
+      - name: Deploy CloudFormation stack
+        if: env.INFRA_TYPE == 'cloudformation'
+        run: |
+          aws cloudformation deploy \
+            --stack-name "$DEPLOY_NAME" \
+            --template-file infrastructure/cloudformation/main-template.yaml \
+            --parameter-overrides \
+              Environment=dev \
+              VpcId="$VPC_ID" \
+              SubnetIds="$SUBNET_IDS" \
+              TemplateBucket="$TEMPLATE_BUCKET" \
+              DeploymentName="$DEPLOY_NAME" \
+            --capabilities CAPABILITY_NAMED_IAM
+
+      - name: Upload website files
+        if: env.INFRA_TYPE == 'cloudformation'
+        run: |
+          BUCKET_NAME=$(aws cloudformation describe-stacks --stack-name ${{ env.DEPLOY_NAME }} --query "Stacks[0].Outputs[?OutputKey=='WebsiteBucketName'].OutputValue" --output text)
+          aws s3 sync src/frontend/ s3://$BUCKET_NAME/
+
+      - name: Get CloudFront URL
+        if: env.INFRA_TYPE == 'cloudformation'
+        run: |
+          WEBSITE_URL=$(aws cloudformation describe-stacks --stack-name ${{ env.DEPLOY_NAME }} --query "Stacks[0].Outputs[?OutputKey=='WebsiteUrl'].OutputValue" --output text)
+          echo "Your website is available at: $WEBSITE_URL"
+
+      # --- Terraform ---
+      - name: Set up Terraform
+        if: env.INFRA_TYPE == 'terraform'
+        uses: hashicorp/setup-terraform@v4
+
+      # vpc_id/subnet_ids are passed explicitly
+      - name: Deploy Terraform resources
+        if: env.INFRA_TYPE == 'terraform'
+        run: |
+          cd infrastructure/terraform
+          SUBNET_IDS_JSON=$(printf '%s' "$SUBNET_IDS" | jq -Rc 'split(",")')
+          terraform init -backend-config=backend.hcl -backend-config="key=envs/${DEPLOY_NAME}/terraform.tfstate"
+          terraform apply -auto-approve \
+            -var="environment=dev" \
+            -var="project_name=${DEPLOY_NAME}" \
+            -var="vpc_id=${VPC_ID}" \
+            -var="subnet_ids=${SUBNET_IDS_JSON}"
+
+      - name: Upload website files (Terraform)
+        if: env.INFRA_TYPE == 'terraform'
+        run: |
+          BUCKET_NAME=$(cd infrastructure/terraform && terraform output -raw website_bucket_name)
+          aws s3 sync src/frontend/ s3://$BUCKET_NAME/
+
+      - name: Get CloudFront URL (Terraform)
+        if: env.INFRA_TYPE == 'terraform'
+        run: |
+          WEBSITE_URL=$(cd infrastructure/terraform && terraform output -raw website_url)
+          echo "Your website is available at: $WEBSITE_URL"
+
+      # --- Application type (independent of the infra-type steps above:
+      # infraType provisions the shared network-facing infra, applicationType
+      # deploys the app workload that runs on it) ---
+      - name: Deploy with Serverless Framework
+        if: env.APP_TYPE == 'serverless'
+        run: |
+          npm install -g serverless@3
+          serverless deploy --stage "$DEPLOY_NAME"
+
+      - name: Application type has no automated deploy step
+        if: env.APP_TYPE == 'container' || env.APP_TYPE == 'ec2'
+        run: |
+          echo "::warning::applicationType '${APP_TYPE}' was generated by init.sh (docker-compose.yml / user-data.sh) but this pipeline has no automated deploy step for it yet — nothing was deployed for the application layer. See infrastructure/ for the network/hosting resources that infraType did deploy."
+  # Tears down a branch's dev deployment. Runs automatically when that
+  # branch's PR is merged to main, or on-demand via workflow_dispatch.
+  cleanup:
+    if: |
+      (github.event_name == 'pull_request' && github.event.action == 'closed' && github.event.pull_request.merged == true) ||
+      (github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'cleanup')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION || 'us-east-1' }}
+
+      - name: Read configuration
+        id: config
+        run: |
+          CONFIG_FILE="config/project-config.json"
+          if [ ! -f "$CONFIG_FILE" ]; then
+            echo "No $CONFIG_FILE found — project not initialized yet, nothing to clean up."
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "found=true" >> "$GITHUB_OUTPUT"
+
+          INFRA_TYPE=$(jq -r '.infraType' $CONFIG_FILE)
+          APP_TYPE=$(jq -r '.applicationType' $CONFIG_FILE)
+          VPC_ID=$(jq -r '.vpcId' $CONFIG_FILE)
+          SUBNET_IDS=$(jq -r '.subnetIds' $CONFIG_FILE)
+          echo "INFRA_TYPE=$INFRA_TYPE" >> $GITHUB_ENV
+          echo "APP_TYPE=$APP_TYPE" >> $GITHUB_ENV
+          echo "VPC_ID=$VPC_ID" >> $GITHUB_ENV
+          echo "SUBNET_IDS=$SUBNET_IDS" >> $GITHUB_ENV
+
+      # Recompute the exact same deployment name deploy used. BRANCH_NAME
+      # comes from the merged PR's head branch when triggered by a closed
+      # PR, or from whichever branch this was manually dispatched against —
+      # passed via env, not spliced into the script text.
+      - name: Compute deployment name
+        if: steps.config.outputs.found == 'true'
+        env:
+          BRANCH_NAME: ${{ github.event.pull_request.head.ref || github.ref_name }}
+          REPO_NAME: ${{ github.repository }}
+        run: |
+          REPO_NAME="${REPO_NAME#*/}"
+          DEPLOY_NAME=$(./scripts/compute-deploy-name.sh "$REPO_NAME" "$BRANCH_NAME")
+          echo "DEPLOY_NAME=$DEPLOY_NAME" >> $GITHUB_ENV
+          echo "Deployment name: $DEPLOY_NAME"
+
+      - name: Set up Node.js
+        if: env.APP_TYPE == 'serverless'
+        uses: actions/setup-node@v3
+        with:
+          node-version: '22'
+
+      - name: Destroy CloudFormation resources
+        if: env.INFRA_TYPE == 'cloudformation'
+        uses: ./.github/actions/destroy-cloudformation
+        with:
+          project-name: ${{ env.DEPLOY_NAME }}
+
+      - name: Destroy Terraform resources
+        if: env.INFRA_TYPE == 'terraform'
+        uses: ./.github/actions/destroy-terraform
+        with:
+          environment: dev
+          deploy-name: ${{ env.DEPLOY_NAME }}
+          vpc-id: ${{ env.VPC_ID }}
+          subnet-ids: ${{ env.SUBNET_IDS }}
+
+      - name: Destroy Serverless Framework resources
+        if: env.APP_TYPE == 'serverless'
+        uses: ./.github/actions/destroy-serverless
+        with:
+          environment: ${{ env.DEPLOY_NAME }}
+
+      - name: Application type has no automated destroy step
+        if: env.APP_TYPE == 'container' || env.APP_TYPE == 'ec2'
+        run: |
+          echo "::warning::applicationType '${APP_TYPE}' has no automated destroy step — there is nothing at the application layer for this pipeline to tear down."
+
+      # Deletes the branch itself once its PR is merged. Only for the
+      # automatic merge trigger — a manual workflow_dispatch cleanup might
+      # be tearing down AWS resources for a branch that's still in active
+      # use, so it never touches the branch. Non-fatal if the branch is
+      # already gone (e.g. the repo also has GitHub's own "Automatically
+      # delete head branches" setting enabled — the two don't conflict).
+      - name: Delete merged branch
+        if: github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BRANCH_NAME: ${{ github.event.pull_request.head.ref }}
+        run: |
+          echo "Deleting branch: $BRANCH_NAME"
+          gh api -X DELETE "repos/${{ github.repository }}/git/refs/heads/$BRANCH_NAME" \
+            || echo "Branch already deleted or could not be deleted — continuing."

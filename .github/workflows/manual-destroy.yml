@@ -1,0 +1,116 @@
+name: Manual Infrastructure Destroy
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to destroy (dev/prod)'
+        required: true
+        default: 'dev'
+        type: choice
+        options:
+          - dev
+          - prod
+      confirmation:
+        description: 'Type "DESTROY" to confirm destruction of resources'
+        required: true
+        type: string
+
+jobs:
+  validate-confirmation:
+    name: Validate Confirmation
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check confirmation input
+        if: ${{ github.event.inputs.confirmation != 'DESTROY' }}
+        run: |
+          echo "Error: You must type 'DESTROY' exactly to confirm resource destruction"
+          exit 1
+
+  destroy-infrastructure:
+    name: Destroy Infrastructure
+    needs: validate-confirmation
+    runs-on: ubuntu-latest
+    environment: ${{ github.event.inputs.environment }}
+    
+    steps:
+    - uses: actions/checkout@v3
+    
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v2
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ secrets.AWS_REGION || 'us-east-1' }}
+    
+    - name: Read configuration
+      id: config
+      run: |
+        CONFIG_FILE="config/project-config.json"
+        if [ ! -f "$CONFIG_FILE" ]; then
+          echo "Error: Config file not found at $CONFIG_FILE"
+          exit 1
+        fi
+
+        INFRA_TYPE=$(jq -r '.infraType' $CONFIG_FILE)
+        APP_TYPE=$(jq -r '.applicationType' $CONFIG_FILE)
+        VPC_ID=$(jq -r '.vpcId' $CONFIG_FILE)
+        SUBNET_IDS=$(jq -r '.subnetIds' $CONFIG_FILE)
+        echo "INFRA_TYPE=$INFRA_TYPE" >> $GITHUB_ENV
+        echo "APP_TYPE=$APP_TYPE" >> $GITHUB_ENV
+        echo "VPC_ID=$VPC_ID" >> $GITHUB_ENV
+        echo "SUBNET_IDS=$SUBNET_IDS" >> $GITHUB_ENV
+
+    # prod isn't tied to any branch (nothing in this template deploys it
+    # automatically — see docs/deployment/ci-cd-pipeline.md), so it gets a
+    # fixed name. dev recomputes the same per-branch name deploy used, from
+    # whichever branch this workflow was dispatched against. Named from the
+    # repo itself, not config/project-config.json's free-text projectName.
+    # BRANCH_NAME is passed via env, not spliced into the script text,
+    # since it's attacker-influenceable data.
+    - name: Compute deployment name
+      env:
+        ENVIRONMENT: ${{ github.event.inputs.environment }}
+        BRANCH_NAME: ${{ github.ref_name }}
+        REPO_NAME: ${{ github.repository }}
+      run: |
+        REPO_NAME="${REPO_NAME#*/}"
+        if [ "$ENVIRONMENT" == "prod" ]; then
+          DEPLOY_NAME=$(./scripts/compute-deploy-name.sh "$REPO_NAME" --prod)
+        else
+          DEPLOY_NAME=$(./scripts/compute-deploy-name.sh "$REPO_NAME" "$BRANCH_NAME")
+        fi
+        echo "DEPLOY_NAME=$DEPLOY_NAME" >> $GITHUB_ENV
+        echo "Deployment name: $DEPLOY_NAME"
+
+    - name: Set up Node.js
+      if: env.APP_TYPE == 'serverless'
+      uses: actions/setup-node@v3
+      with:
+        node-version: '22'
+
+    - name: Destroy CloudFormation resources
+      if: env.INFRA_TYPE == 'cloudformation'
+      uses: ./.github/actions/destroy-cloudformation
+      with:
+        project-name: ${{ env.DEPLOY_NAME }}
+
+    - name: Destroy Terraform resources
+      if: env.INFRA_TYPE == 'terraform'
+      uses: ./.github/actions/destroy-terraform
+      with:
+        environment: ${{ github.event.inputs.environment }}
+        deploy-name: ${{ env.DEPLOY_NAME }}
+        vpc-id: ${{ env.VPC_ID }}
+        subnet-ids: ${{ env.SUBNET_IDS }}
+
+    - name: Destroy Serverless Framework resources
+      if: env.APP_TYPE == 'serverless'
+      uses: ./.github/actions/destroy-serverless
+      with:
+        environment: ${{ env.DEPLOY_NAME }}
+
+    - name: Application type has no automated destroy step
+      if: env.APP_TYPE == 'container' || env.APP_TYPE == 'ec2'
+      run: |
+        echo "::warning::applicationType '${APP_TYPE}' has no automated destroy step — there is nothing at the application layer for this pipeline to tear down."

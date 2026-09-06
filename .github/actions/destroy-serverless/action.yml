@@ -1,0 +1,22 @@
+name: 'Destroy Serverless Framework Resources'
+description: 'Destroys resources deployed with Serverless Framework'
+
+inputs:
+  environment:
+    description: 'Stage to destroy — the deployment name for a branch env, or a fixed name like "prod"'
+    required: true
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Install Serverless Framework
+      shell: bash
+      run: npm install -g serverless@3
+
+    - name: Remove Serverless Resources
+      shell: bash
+      env:
+        STAGE: ${{ inputs.environment }}
+      run: |
+        echo "Destroying with Serverless Framework for stage: $STAGE"
+        serverless remove --stage "$STAGE"

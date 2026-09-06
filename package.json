@@ -1,0 +1,20 @@
+{
+  "name": "aws-project-template",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Starting point for AWS projects — CI/CD, IaC, and application code.",
+  "scripts": {
+    "lint": "eslint .",
+    "format": "prettier --check .",
+    "format:fix": "prettier --write .",
+    "test": "jest"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "eslint": "^10.9.1",
+    "eslint-config-prettier": "^10.1.8",
+    "globals": "^17.12.0",
+    "jest": "^30.5.1",
+    "prettier": "^3.9.6"
+  }
+}
