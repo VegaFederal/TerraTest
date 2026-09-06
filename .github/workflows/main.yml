@@ -28,7 +28,7 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v7
       - name: Set up environment
         run: echo "Setting up test environment"
       - name: Run tests
@@ -46,10 +46,10 @@ jobs:
       (github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'deploy')
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v7
 
       - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v2
+        uses: aws-actions/configure-aws-credentials@v6
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
@@ -90,7 +90,7 @@ jobs:
 
       - name: Set up Node.js
         if: env.APP_TYPE == 'serverless'
-        uses: actions/setup-node@v3
+        uses: actions/setup-node@v7
         with:
           node-version: '22'
 
@@ -199,10 +199,10 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v7
 
       - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v2
+        uses: aws-actions/configure-aws-credentials@v6
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
@@ -245,7 +245,7 @@ jobs:
 
       - name: Set up Node.js
         if: env.APP_TYPE == 'serverless'
-        uses: actions/setup-node@v3
+        uses: actions/setup-node@v7
         with:
           node-version: '22'
 
