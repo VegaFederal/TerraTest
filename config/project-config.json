@@ -1,0 +1,11 @@
+{
+  "projectName": "TerraTest",
+  "description": "ahfgjhk adjkg djhg aldfh",
+  "infraType": "terraform",
+  "applicationType": "",
+  "awsRegion": "us-east-1",
+  "vpcId": "vpc-03de7ad5a4c7c1822",
+  "subnetIds": "subnet-02615277a84a5fcb4,subnet-005d1ad197eb59c2b",
+  "githubRepo": "https://github.com/VegaFederal/TerraTest",
+  "createdAt": "2026-09-06T20:41:04Z"
+}
